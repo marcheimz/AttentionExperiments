@@ -49,10 +49,21 @@ def generate_batch(batch_size, num_points):
     closest_dist = masked_dists.min(dim=1).values
     return radar_xy, radar_dir, pts, closest_dist
 
+def transform_to_radar_frame(radar_xy, radar_dir, pts):
+    vecs = pts - radar_xy[:, None, :]  # (B, N, 2)
+    dir_x = radar_dir[:, 0]
+    dir_y = radar_dir[:, 1]
+
+    rot = torch.stack([
+        torch.stack([dir_x, dir_y], dim=1),
+        torch.stack([-dir_y, dir_x], dim=1)
+    ], dim=1)  # (B, 2, 2)
+
+    return torch.bmm(vecs, rot)
 
 # === Fully Connected Model ===
 class FCModel(nn.Module):
-    def __init__(self, num_points):
+    def __init__(self, num_points, transform_to_radar_frame=False):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(2 + 2 + num_points * 2, 128),
@@ -61,14 +72,18 @@ class FCModel(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 1)
         )
+        self.transform_to_radar_frame=transform_to_radar_frame
 
     def forward(self, radar_xy, radar_dir, pts):
+        if self.transform_to_radar_frame:
+            pts = transform_to_radar_frame(radar_xy, radar_dir, pts)
+
         x = torch.cat([radar_xy, radar_dir, pts.view(pts.shape[0], -1)], dim=1)
         return self.fc(x).squeeze(-1)
 
 
 class MultiHeadMLPAttentionModel(nn.Module):
-    def __init__(self, hidden_dim=64, num_heads=4):
+    def __init__(self, hidden_dim=64, num_heads=4, transform_to_radar_frame=False):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
@@ -77,6 +92,8 @@ class MultiHeadMLPAttentionModel(nn.Module):
         self.point_encoder = nn.Sequential(
             nn.Linear(6, hidden_dim),
             nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
 
@@ -84,6 +101,8 @@ class MultiHeadMLPAttentionModel(nn.Module):
         self.attn_score_nets = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(6, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, 1)
             ) for _ in range(num_heads)
@@ -96,10 +115,14 @@ class MultiHeadMLPAttentionModel(nn.Module):
             nn.Linear(64, 1)
         )
 
-        self.last_attn_weights = None  # shape: (B, num_heads, N)
+        self.last_attn_weights = None
+        self.transform_to_radar_frame=transform_to_radar_frame
 
     def forward(self, radar_xy, radar_dir, pts):
         B, N, _ = pts.shape
+
+        if self.transform_to_radar_frame:
+            pts = transform_to_radar_frame(radar_xy, radar_dir, pts)
 
         # Expand radar to per-point shape: (B, N, 4)
         radar = torch.cat([radar_xy, radar_dir], dim=-1).unsqueeze(1).expand(-1, N, -1)
@@ -252,6 +275,8 @@ def plot_loss(losses, name):
 
 val_data =  generate_batch(val_batch_size, num_points)
 
+print(device)
+
 # === Run Experiments ===
 fc_model = FCModel(num_points)
 fc_optim = torch.optim.Adam(fc_model.parameters(), lr=1e-3)
@@ -260,3 +285,11 @@ train(fc_model, fc_optim, "fc", val_data)
 attn_model = MultiHeadMLPAttentionModel()
 attn_optim = torch.optim.Adam(attn_model.parameters(), lr=1e-3)
 train(attn_model, attn_optim, "attention", val_data)
+
+fc_model = FCModel(num_points, transform_to_radar_frame=True)
+fc_optim = torch.optim.Adam(fc_model.parameters(), lr=1e-3)
+train(fc_model, fc_optim, "fc transformed", val_data)
+
+attn_model = MultiHeadMLPAttentionModel(transform_to_radar_frame=True)
+attn_optim = torch.optim.Adam(attn_model.parameters(), lr=1e-3)
+train(attn_model, attn_optim, "attention transformed", val_data)
